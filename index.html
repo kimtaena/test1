@@ -6,6 +6,7 @@
 <title>우리 카드 장부</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root{
   --ink:#1C2536; --paper:#FAFAF8; --card:#FFFFFF; --line:#E5E3DC; --mut:#8A897F;
@@ -78,6 +79,15 @@ textarea{resize:none;height:60px}
 <div class="wrap">
 <header><h1>우리 카드 장부</h1><p>레드카드 · 결제 10초 기록 → 월말 자동 정산 → 엑셀</p></header>
 <div id="loading">불러오는 중…</div>
+<div id="gate" style="display:none;position:fixed;inset:0;background:var(--paper);z-index:100;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="max-width:320px;width:100%;text-align:center">
+    <h2 style="font-size:17px">우리 카드 장부</h2>
+    <p class="hint" style="margin-top:6px">두 사람만 아는 암호를 입력해 주세요</p>
+    <input id="gate-pw" type="password" inputmode="numeric" autocomplete="off" placeholder="암호" style="text-align:center;letter-spacing:3px;margin:14px 0 6px" onkeydown="if(event.key==='Enter')tryGate()">
+    <p id="gate-err" style="display:none;color:var(--bad);font-size:12px;margin-bottom:8px">암호가 맞지 않아요</p>
+    <button class="btn" onclick="tryGate()">들어가기</button>
+  </div>
+</div>
 <div id="app" style="display:none">
 <nav id="nav"></nav>
 <div id="view"></div>
@@ -86,6 +96,13 @@ textarea{resize:none;height:60px}
 </div>
 <script>
 const KEY='taena-couple-ledger-v1';
+/* ── Supabase 공유 설정 ── */
+const SB_URL='https://ocxjxdxuonfyyhsbmmdt.supabase.co';
+const SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9jeGp4ZHh1b25meXloc2JtbWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0MjQ2MjgsImV4cCI6MjA5OTAwMDYyOH0.xanVKjUh7ZTzt415GZRLp3b6Q6lNLQp9YUvejRsRRbk';
+const ROW_ID='shared';
+const GATE_PW='1024';
+const GATE_KEY='taena-couple-ledger-gate';
+let sb=null, online=false, lastRemoteSync=null, pushTimer=null;
 const fmt=n=>(n<0?'-':'')+'₩'+Math.abs(Math.round(n)).toLocaleString();
 const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');};
 const CATS=['외식·카페','배달음식','온라인쇼핑','마트·편의점','주유·차량','쇼핑(백화점·패션)','주류','여행·숙박','택시·교통','의료·약국','문화·레저','구독·디지털','통신','수수료','기타'];
@@ -120,21 +137,124 @@ async function writeData(str){
   }
   return false;
 }
-async function load(){
+/* ── 입장 잠금 ── */
+function passGate(){
+  let ok=false; try{ ok=localStorage.getItem(GATE_KEY)==='1'; }catch(e){}
+  return ok;
+}
+function tryGate(){
+  const inp=document.getElementById('gate-pw');
+  if(inp.value===GATE_PW){
+    try{ localStorage.setItem(GATE_KEY,'1'); }catch(e){}
+    document.getElementById('gate').style.display='none';
+    startApp();
+  }else{
+    document.getElementById('gate-err').style.display='block';
+    inp.value=''; inp.focus();
+  }
+}
+
+/* ── Supabase 공유 ── */
+function normalize(o){
+  const d=JSON.parse(JSON.stringify(DEFAULT));
+  if(!o||typeof o!=='object') return d;
+  return {month:o.month||d.month, entries:o.entries||[], transfers:o.transfers||[], groups:o.groups||[], archive:o.archive||[], lastSaved:o.lastSaved||null};
+}
+function initSb(){
+  try{ if(window.supabase&&window.supabase.createClient){ sb=window.supabase.createClient(SB_URL,SB_KEY); } }
+  catch(e){ sb=null; }
+}
+async function sbRead(){
+  if(!sb) return null;
+  try{
+    const {data,error}=await sb.from('ledger').select('data,updated_at').eq('id',ROW_ID).maybeSingle();
+    if(error) throw error;
+    online=true;
+    return data; // {data:{...}, updated_at} 또는 null
+  }catch(e){ online=false; return null; }
+}
+function schedulePush(){ if(!sb) return; clearTimeout(pushTimer); pushTimer=setTimeout(pushRemote,1200); }
+async function pushRemote(){
+  if(!sb) return;
+  try{
+    const {error}=await sb.from('ledger').upsert({id:ROW_ID, data:S, updated_at:new Date().toISOString()});
+    if(error) throw error;
+    online=true;
+  }catch(e){ online=false; }
+  renderStat();
+}
+function stableStr(o){ // jsonb 키 순서 무관 비교용 (키를 정렬해서 직렬화)
+  return JSON.stringify(o,(k,v)=>(v&&typeof v==='object'&&!Array.isArray(v))?Object.keys(v).sort().reduce((a,key)=>{a[key]=v[key];return a;},{}):v);
+}
+function applyRemote(remoteObj, updatedAt){
+  if(!remoteObj) return;
+  if(stableStr(remoteObj)===stableStr(S)){ lastRemoteSync=updatedAt; return; } // 내가 올린 것/동일 → 무시
+  const ae=document.activeElement;
+  if(ae&&/^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName)) return; // 입력 중이면 다음 폴링에서 반영
+  S=normalize(remoteObj);
+  lastRemoteSync=updatedAt;
+  writeData(JSON.stringify(S)); // 로컬 캐시
+  render();
+}
+function subscribeRealtime(){
+  if(!sb) return;
+  try{
+    sb.channel('ledger-shared')
+      .on('postgres_changes',{event:'*',schema:'public',table:'ledger',filter:'id=eq.'+ROW_ID},payload=>{
+        const row=payload.new;
+        if(row&&row.data){ online=true; applyRemote(row.data,row.updated_at); }
+      })
+      .subscribe();
+  }catch(e){}
+}
+async function poll(){
+  const remote=await sbRead();
+  if(remote&&remote.data) applyRemote(remote.data,remote.updated_at);
+  renderStat();
+}
+
+async function startApp(){
   await detectBackend();
-  try{const raw=await readData();S=raw?JSON.parse(raw):JSON.parse(JSON.stringify(DEFAULT));}catch(e){S=JSON.parse(JSON.stringify(DEFAULT));}
+  initSb();
+  // 1) 공유(원격) 우선 → 없으면 로컬 폴백
+  const remote=await sbRead();
+  if(remote&&remote.data){
+    S=normalize(remote.data);
+    lastRemoteSync=remote.updated_at;
+    writeData(JSON.stringify(S));
+  }else{
+    try{const raw=await readData();S=normalize(raw?JSON.parse(raw):null);}catch(e){S=normalize(null);}
+    if(sb&&online&&!remote) schedulePush(); // 원격이 비어있으면 로컬 내용으로 씨앗 저장
+  }
   document.getElementById('loading').style.display='none';
   document.getElementById('app').style.display='block';
   render();
+  subscribeRealtime();
+  setInterval(poll,10000);
+}
+async function load(){
+  if(passGate()){ startApp(); }
+  else{
+    document.getElementById('loading').style.display='none';
+    document.getElementById('gate').style.display='flex';
+    const inp=document.getElementById('gate-pw'); if(inp) inp.focus();
+  }
 }
 async function saveAll(toast){
   S.lastSaved=new Date().toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
   const ok=await writeData(JSON.stringify(S));
+  schedulePush();
   const el=document.getElementById('savestat');
   if(ok){if(toast){el.innerHTML='<span class="toast">저장 완료 · '+S.lastSaved+'</span>';setTimeout(renderStat,2500);}else renderStat();}
   else el.textContent='임시 모드 — 닫기 전에 엑셀로 내보내 두세요';
 }
-function renderStat(){const lb=backend==='memory'?' · 임시 모드':'';document.getElementById('savestat').textContent=(S.lastSaved?'마지막 저장 '+S.lastSaved:'아직 저장 안 됨')+lb;}
+function renderStat(){
+  const lb=backend==='memory'?' · 임시 모드':'';
+  let sync='';
+  if(sb) sync=online?' · <span style="color:var(--ok)">● 온라인 공유 중</span>':' · <span style="color:var(--bad)">● 오프라인(로컬 저장)</span>';
+  else sync=' · <span style="color:var(--bad)">● 오프라인(로컬 저장)</span>';
+  document.getElementById('savestat').innerHTML=(S.lastSaved?'마지막 저장 '+S.lastSaved:'아직 저장 안 됨')+lb+sync;
+}
 
 const TABS=[['add','입력'],['list','내역'],['grp','모임'],['tr','이체'],['sum','정산·엑셀']];
 function render(){
